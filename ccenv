@@ -208,7 +208,21 @@ def cmd_use(args: argparse.Namespace) -> None:
     write_marker(claude_dir, name, hash_val)
 
     print(f'Profile "{name}" applied to .claude/')
-    print("Launch Claude Code with: claude --setting-sources project,local")
+
+    # Warn if global config may conflict
+    global_dir = Path.home() / ".claude"
+    if global_dir.is_dir() and global_dir != claude_dir.resolve():
+        global_files = [f for f in PROFILE_FILES if (global_dir / f).is_file()]
+        global_dirs = [
+            (d, sum(1 for f in (global_dir / d).rglob("*") if f.is_file()))
+            for d in PROFILE_DIRS if (global_dir / d).is_dir()
+        ]
+        global_dirs = [(d, c) for d, c in global_dirs if c > 0]
+        if global_files or global_dirs:
+            parts = global_files + [f"{d}/ ({c} files)" for d, c in global_dirs]
+            print(f'\nNote: Global config (~/.claude/) contains: {", ".join(parts)}')
+            print("These will load alongside this profile unless cleared.")
+            print('Run "ccenv save <name>" then "ccenv clear" to isolate this environment.')
 
 
 def cmd_eject(_args: argparse.Namespace) -> None:
@@ -464,24 +478,10 @@ def cmd_diff(args: argparse.Namespace) -> None:
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
 
-SHELL_INTEGRATION = """\
-Shell integration:
-  Add to your .bashrc or .zshrc to auto-apply --setting-sources:
-
-    claude() {
-      if [ -f ".claude/.profile" ]; then
-        command claude --setting-sources project,local "$@"
-      else
-        command claude "$@"
-      fi
-    }"""
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ccenv",
         description="ccenv — Claude Code Environments\n\nManage reusable configuration profiles for Claude Code.",
-        epilog=SHELL_INTEGRATION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-v", "--version", action="version", version=f"ccenv {VERSION}")

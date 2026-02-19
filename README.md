@@ -42,12 +42,12 @@ export PATH="$HOME/.local/bin:$PATH"
 # Save your current global config as a profile
 ccenv save my-setup
 
-# Apply it to a project
+# Clear global config so it doesn't bleed into projects
+ccenv clear
+
+# Apply the profile to a project
 cd ~/projects/my-app
 ccenv use my-setup
-
-# Launch Claude Code with project-level config
-claude --setting-sources project,local
 ```
 
 ## Commands
@@ -93,20 +93,6 @@ ccenv clear --scope project   # clear ./.claude/ (project)
 ### `ccenv eject`
 
 Detach the project from its profile. Config files stay, but tracking stops — changes no longer sync in either direction.
-
-## Shell Integration (Optional)
-
-Add this to your `.bashrc` or `.zshrc` to automatically pass `--setting-sources project,local` when a profile is active:
-
-```sh
-claude() {
-  if [ -f ".claude/.profile" ]; then
-    command claude --setting-sources project,local "$@"
-  else
-    command claude "$@"
-  fi
-}
-```
 
 ## Typical Workflows
 
