@@ -225,6 +225,49 @@ def cmd_eject(_args: argparse.Namespace) -> None:
     print("Project is now independent. Changes here won't affect the profile.")
 
 
+def cmd_clear(args: argparse.Namespace) -> None:
+    scope: str = args.scope
+
+    if scope == "global":
+        claude_dir = Path.home() / ".claude"
+        label = "global (~/.claude/)"
+    else:
+        claude_dir = Path.cwd() / ".claude"
+        label = "project (.claude/)"
+
+    if not claude_dir.is_dir():
+        die(f"clear: {label} directory does not exist")
+
+    # Check what's actually there
+    managed_files = [f for f in PROFILE_FILES if (claude_dir / f).is_file()]
+    managed_dirs = [d for d in PROFILE_DIRS if (claude_dir / d).is_dir()]
+    marker = read_marker(claude_dir)
+
+    if not managed_files and not managed_dirs:
+        print(f"Nothing to clear in {label}.")
+        return
+
+    print(f"This will remove from {label}:")
+    for f in managed_files:
+        print(f"  {f}")
+    for d in managed_dirs:
+        count = sum(1 for _ in (claude_dir / d).rglob("*") if _.is_file())
+        print(f"  {d}/ ({count} file{'s' if count != 1 else ''})")
+    if marker:
+        print(f"  .profile (marker for '{marker[0]}')")
+
+    print()
+    if not confirm("Remove all managed files?"):
+        print("Aborted.")
+        return
+
+    remove_profile_files(claude_dir)
+    if marker:
+        (claude_dir / PROFILE_MARKER).unlink()
+
+    print(f"Cleared managed files from {label}.")
+
+
 def cmd_status(_args: argparse.Namespace) -> None:
     ensure_profiles_dir()
 
@@ -458,6 +501,11 @@ def build_parser() -> argparse.ArgumentParser:
     # eject
     sub.add_parser("eject", help="Detach project from its profile")
 
+    # clear
+    p_clear = sub.add_parser("clear", help="Remove all managed config files (clean slate)")
+    p_clear.add_argument("--scope", default="global", choices=["global", "project"],
+                         help="Which config to clear (default: global)")
+
     # status
     sub.add_parser("status", help="Show profile state for this project")
 
@@ -486,6 +534,7 @@ def main() -> None:
         "save": cmd_save,
         "use": cmd_use,
         "eject": cmd_eject,
+        "clear": cmd_clear,
         "status": cmd_status,
         "update": cmd_update,
         "list": cmd_list,
