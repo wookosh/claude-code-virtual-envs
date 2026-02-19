@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # ccenv installer — copies ccenv to ~/.local/bin/ and sets up shell integration
+# Requires Python 3.10+
 
 INSTALL_DIR="${HOME}/.local/bin"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

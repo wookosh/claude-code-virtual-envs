@@ -1,529 +1,427 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""ccenv — Claude Code Environments
 
-# ccenv — Claude Code Environments
-# Manages reusable configuration profiles for Claude Code.
+Manages reusable configuration profiles for Claude Code.
+"""
 
-VERSION="1.0.0"
-PROFILES_DIR="${HOME}/.claude-profiles"
-PROFILE_MARKER=".profile"
+import argparse
+import difflib
+import hashlib
+import os
+import shutil
+import sys
+from pathlib import Path
+
+VERSION = "1.0.0"
+PROFILES_DIR = Path.home() / ".claude-profiles"
+PROFILE_MARKER = ".profile"
 
 # Files/dirs that belong to a profile (managed by ccenv)
-PROFILE_FILES=("settings.json" "CLAUDE.md")
-PROFILE_DIRS=("agents" "skills" "rules")
+PROFILE_FILES = ("settings.json", "CLAUDE.md")
+PROFILE_DIRS = ("agents", "skills", "rules")
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
 
-die() { printf 'ccenv: %b\n' "$*" >&2; exit 1; }
+def die(msg: str) -> None:
+    print(f"ccenv: {msg}", file=sys.stderr)
+    sys.exit(1)
 
-confirm() {
-    local prompt="${1:-Continue?}"
-    printf '%s [y/N] ' "$prompt" >&2
-    read -r answer
-    [[ "$answer" =~ ^[Yy]$ ]]
-}
 
-ensure_profiles_dir() {
-    if [[ ! -d "$PROFILES_DIR" ]]; then
-        mkdir -p "$PROFILES_DIR/_default"
-        cat > "$PROFILES_DIR/_default/settings.json" <<'DEFAULTSETTINGS'
-{}
-DEFAULTSETTINGS
-        cat > "$PROFILES_DIR/_default/CLAUDE.md" <<'DEFAULTMD'
-# Claude Code
+def confirm(prompt: str = "Continue?") -> bool:
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
-Add your system instructions here.
-DEFAULTMD
-        mkdir -p "$PROFILES_DIR/_default/agents"
-        mkdir -p "$PROFILES_DIR/_default/skills"
-        mkdir -p "$PROFILES_DIR/_default/rules"
-        printf 'Created %s with _default profile.\n' "$PROFILES_DIR"
-        printf 'Tip: run "ccenv save original --from global" to preserve your existing config.\n'
-    fi
-}
 
-# Compute a sha256 hash of all profile-managed content in a directory.
-# Usage: compute_hash <dir>
-compute_hash() {
-    local dir="$1"
-    (
-        cd "$dir"
-        # Collect all profile-managed files, sort for determinism, hash contents
-        {
-            for f in "${PROFILE_FILES[@]}"; do
-                [[ -f "$f" ]] && cat "$f"
-            done
-            for d in "${PROFILE_DIRS[@]}"; do
-                if [[ -d "$d" ]]; then
-                    find "$d" -type f | sort | while IFS= read -r file; do
-                        cat "$file"
-                    done
-                fi
-            done
-        } | sha256sum | awk '{print $1}'
-    )
-}
+def ensure_profiles_dir() -> None:
+    if PROFILES_DIR.exists():
+        return
+    default = PROFILES_DIR / "_default"
+    default.mkdir(parents=True)
+    (default / "settings.json").write_text("{}\n")
+    (default / "CLAUDE.md").write_text("# Claude Code\n\nAdd your system instructions here.\n")
+    (default / "agents").mkdir()
+    (default / "skills").mkdir()
+    (default / "rules").mkdir()
+    print(f"Created {PROFILES_DIR} with _default profile.")
+    print('Tip: run "ccenv save original --from global" to preserve your existing config.')
 
-# Copy profile-managed files from src to dst.
-# Usage: copy_profile_files <src> <dst>
-copy_profile_files() {
-    local src="$1" dst="$2"
-    mkdir -p "$dst"
-    for f in "${PROFILE_FILES[@]}"; do
-        if [[ -f "$src/$f" ]]; then
-            cp "$src/$f" "$dst/$f"
-        fi
-    done
-    for d in "${PROFILE_DIRS[@]}"; do
-        if [[ -d "$src/$d" ]]; then
-            rm -rf "$dst/$d"
-            cp -r "$src/$d" "$dst/$d"
-        fi
-    done
-}
 
-# Remove profile-managed files from a directory, preserving .local files.
-# Usage: remove_profile_files <dir>
-remove_profile_files() {
-    local dir="$1"
-    for f in "${PROFILE_FILES[@]}"; do
-        [[ -f "$dir/$f" ]] && rm -f "$dir/$f"
-    done
-    for d in "${PROFILE_DIRS[@]}"; do
-        [[ -d "$dir/$d" ]] && rm -rf "$dir/$d"
-    done
-}
+def compute_hash(directory: Path) -> str:
+    h = hashlib.sha256()
+    for f in PROFILE_FILES:
+        p = directory / f
+        if p.is_file():
+            h.update(p.read_bytes())
+    for d in PROFILE_DIRS:
+        p = directory / d
+        if p.is_dir():
+            for fp in sorted(p.rglob("*")):
+                if fp.is_file():
+                    h.update(fp.read_bytes())
+    return h.hexdigest()
 
-# Write the .profile marker file.
-# Usage: write_marker <claude_dir> <profile_name> <hash>
-write_marker() {
-    local dir="$1" name="$2" hash="$3"
-    printf '%s\n%s\n' "$name" "$hash" > "$dir/$PROFILE_MARKER"
-}
 
-# Read the .profile marker. Sets MARKER_NAME and MARKER_HASH.
-# Returns 1 if no marker exists.
-read_marker() {
-    local dir="$1"
-    if [[ ! -f "$dir/$PROFILE_MARKER" ]]; then
-        return 1
-    fi
-    MARKER_NAME="$(sed -n '1p' "$dir/$PROFILE_MARKER")"
-    MARKER_HASH="$(sed -n '2p' "$dir/$PROFILE_MARKER")"
-}
+def copy_profile_files(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in PROFILE_FILES:
+        sp = src / f
+        if sp.is_file():
+            shutil.copy2(sp, dst / f)
+    for d in PROFILE_DIRS:
+        sp = src / d
+        dp = dst / d
+        if sp.is_dir():
+            if dp.exists():
+                shutil.rmtree(dp)
+            shutil.copytree(sp, dp)
 
-# Count items in a profile dir for listing.
-count_items() {
-    local dir="$1" subdir="$2"
-    if [[ -d "$dir/$subdir" ]]; then
-        find "$dir/$subdir" -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' '
-    else
-        echo 0
-    fi
-}
+
+def remove_profile_files(directory: Path) -> None:
+    for f in PROFILE_FILES:
+        p = directory / f
+        if p.is_file():
+            p.unlink()
+    for d in PROFILE_DIRS:
+        p = directory / d
+        if p.is_dir():
+            shutil.rmtree(p)
+
+
+def write_marker(claude_dir: Path, name: str, hash_val: str) -> None:
+    (claude_dir / PROFILE_MARKER).write_text(f"{name}\n{hash_val}\n")
+
+
+def read_marker(claude_dir: Path) -> tuple[str, str] | None:
+    marker = claude_dir / PROFILE_MARKER
+    if not marker.is_file():
+        return None
+    lines = marker.read_text().splitlines()
+    name = lines[0] if len(lines) > 0 else ""
+    hash_val = lines[1] if len(lines) > 1 else ""
+    return name, hash_val
+
+
+def count_md_files(directory: Path, subdir: str) -> int:
+    p = directory / subdir
+    if not p.is_dir():
+        return 0
+    return sum(1 for f in p.rglob("*.md") if f.is_file())
+
+
+def count_skills(directory: Path) -> int:
+    p = directory / "skills"
+    if not p.is_dir():
+        return 0
+    return sum(1 for f in p.rglob("SKILL.md") if f.is_file())
+
+
+def file_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    return path.read_text().splitlines(keepends=True)
+
+
+def collect_relative_files(directory: Path) -> set[str]:
+    if not directory.is_dir():
+        return set()
+    return {str(f.relative_to(directory)) for f in sorted(directory.rglob("*")) if f.is_file()}
+
 
 # ─── Commands ──────────────────────────────────────────────────────────────────
 
-cmd_save() {
-    local name=""
-    local from="global"
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --from)
-                shift
-                from="${1:-}"
-                [[ -z "$from" ]] && die "save: --from requires a value (global|project)"
-                ;;
-            -*)
-                die "save: unknown option '$1'"
-                ;;
-            *)
-                [[ -z "$name" ]] && name="$1" || die "save: unexpected argument '$1'"
-                ;;
-        esac
-        shift
-    done
+def cmd_save(args: argparse.Namespace) -> None:
+    name: str = args.name
+    source: str = args.source
 
-    [[ -z "$name" ]] && die "save: profile name required\nUsage: ccenv save <name> [--from global|project]"
+    ensure_profiles_dir()
 
-    ensure_profiles_dir
+    if source == "global":
+        source_dir = Path.home() / ".claude"
+    elif source == "project":
+        source_dir = Path.cwd() / ".claude"
+    else:
+        die("save: --from must be 'global' or 'project'")
+        return  # unreachable, for type checker
 
-    local source_dir
-    case "$from" in
-        global)  source_dir="${HOME}/.claude" ;;
-        project) source_dir="$(pwd)/.claude" ;;
-        *)       die "save: --from must be 'global' or 'project'" ;;
-    esac
+    if not source_dir.is_dir():
+        die(f"save: source directory '{source_dir}' does not exist")
 
-    [[ -d "$source_dir" ]] || die "save: source directory '$source_dir' does not exist"
+    profile_dir = PROFILES_DIR / name
+    if profile_dir.is_dir():
+        if not confirm(f"Profile '{name}' already exists. Overwrite?"):
+            print("Aborted.")
+            return
+        shutil.rmtree(profile_dir)
 
-    local profile_dir="$PROFILES_DIR/$name"
-    if [[ -d "$profile_dir" ]]; then
-        confirm "Profile '$name' already exists. Overwrite?" || { echo "Aborted."; exit 0; }
-        rm -rf "$profile_dir"
-    fi
+    profile_dir.mkdir(parents=True)
+    copy_profile_files(source_dir, profile_dir)
 
-    mkdir -p "$profile_dir"
-    copy_profile_files "$source_dir" "$profile_dir"
+    print(f'Profile "{name}" saved from {source} config.')
+    print(f"Location: {profile_dir}")
 
-    printf 'Profile "%s" saved from %s config.\n' "$name" "$from"
-    printf 'Location: %s\n' "$profile_dir"
-}
 
-cmd_use() {
-    local name=""
+def cmd_use(args: argparse.Namespace) -> None:
+    name: str = args.name
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -*)  die "use: unknown option '$1'" ;;
-            *)
-                [[ -z "$name" ]] && name="$1" || die "use: unexpected argument '$1'"
-                ;;
-        esac
-        shift
-    done
+    ensure_profiles_dir()
 
-    [[ -z "$name" ]] && die "use: profile name required\nUsage: ccenv use <name>"
+    profile_dir = PROFILES_DIR / name
+    if not profile_dir.is_dir():
+        die(f"use: profile '{name}' not found in {PROFILES_DIR}")
 
-    ensure_profiles_dir
+    claude_dir = Path.cwd() / ".claude"
 
-    local profile_dir="$PROFILES_DIR/$name"
-    [[ -d "$profile_dir" ]] || die "use: profile '$name' not found in $PROFILES_DIR"
+    if claude_dir.is_dir():
+        marker = read_marker(claude_dir)
+        if marker is not None:
+            marker_name, _ = marker
+            if marker_name == name:
+                if not confirm(f"Profile '{name}' is already active. Re-apply?"):
+                    print("Aborted.")
+                    return
+            else:
+                if not confirm(f"Profile '{marker_name}' is currently active. Switch to '{name}'?"):
+                    print("Aborted.")
+                    return
+        else:
+            has_content = any(
+                (claude_dir / f).is_file() for f in PROFILE_FILES
+            ) or any(
+                (claude_dir / d).is_dir() for d in PROFILE_DIRS
+            )
+            if has_content:
+                print("Warning: .claude/ has untracked config (no profile marker).")
+                print('Consider running "ccenv save <name> --from project" first to preserve it.')
+                if not confirm("Overwrite managed files?"):
+                    print("Aborted.")
+                    return
 
-    local claude_dir="$(pwd)/.claude"
+    if claude_dir.is_dir():
+        remove_profile_files(claude_dir)
+    copy_profile_files(profile_dir, claude_dir)
 
-    # Check existing .claude/ state
-    if [[ -d "$claude_dir" ]]; then
-        if [[ -f "$claude_dir/$PROFILE_MARKER" ]]; then
-            read_marker "$claude_dir"
-            if [[ "$MARKER_NAME" == "$name" ]]; then
-                confirm "Profile '$name' is already active. Re-apply?" || { echo "Aborted."; exit 0; }
-            else
-                confirm "Profile '$MARKER_NAME' is currently active. Switch to '$name'?" || { echo "Aborted."; exit 0; }
-            fi
-        else
-            # .claude/ exists but no marker — check if it has managed content
-            local has_content=false
-            for f in "${PROFILE_FILES[@]}"; do
-                [[ -f "$claude_dir/$f" ]] && has_content=true
-            done
-            for d in "${PROFILE_DIRS[@]}"; do
-                [[ -d "$claude_dir/$d" ]] && has_content=true
-            done
-            if $has_content; then
-                printf 'Warning: .claude/ has untracked config (no profile marker).\n'
-                printf 'Consider running "ccenv save <name> --from project" first to preserve it.\n'
-                confirm "Overwrite managed files?" || { echo "Aborted."; exit 0; }
-            fi
-        fi
-    fi
+    hash_val = compute_hash(profile_dir)
+    write_marker(claude_dir, name, hash_val)
 
-    # Remove profile-managed files, then copy new profile
-    if [[ -d "$claude_dir" ]]; then
-        remove_profile_files "$claude_dir"
-    fi
-    copy_profile_files "$profile_dir" "$claude_dir"
+    print(f'Profile "{name}" applied to .claude/')
+    print("Launch Claude Code with: claude --setting-sources project,local")
 
-    # Write marker
-    local hash
-    hash="$(compute_hash "$profile_dir")"
-    write_marker "$claude_dir" "$name" "$hash"
 
-    printf 'Profile "%s" applied to .claude/\n' "$name"
-    printf 'Launch Claude Code with: claude --setting-sources project,local\n'
-}
-
-cmd_eject() {
-    local claude_dir="$(pwd)/.claude"
-
-    [[ -f "$claude_dir/$PROFILE_MARKER" ]] || die "eject: no active profile in this project"
-
-    read_marker "$claude_dir"
-    rm -f "$claude_dir/$PROFILE_MARKER"
-
-    printf 'Ejected from profile "%s".\n' "$MARKER_NAME"
-    printf 'Project is now independent. Changes here won'\''t affect the profile.\n'
-}
-
-cmd_status() {
-    ensure_profiles_dir
-
-    local claude_dir="$(pwd)/.claude"
-
-    if [[ -f "$claude_dir/$PROFILE_MARKER" ]]; then
-        read_marker "$claude_dir"
-        printf 'Active profile: %s\n' "$MARKER_NAME"
-
-        local profile_dir="$PROFILES_DIR/$MARKER_NAME"
-        if [[ -d "$profile_dir" ]]; then
-            local current_hash template_hash
-            # Hash the profile-managed files in the project
-            current_hash="$(compute_hash "$claude_dir")"
-            template_hash="$(compute_hash "$profile_dir")"
-
-            if [[ "$current_hash" == "$MARKER_HASH" && "$current_hash" == "$template_hash" ]]; then
-                printf 'Status: in sync with template\n'
-            else
-                if [[ "$current_hash" != "$MARKER_HASH" ]]; then
-                    printf 'Status: project files have drifted from applied profile\n'
-                fi
-                if [[ "$template_hash" != "$MARKER_HASH" ]]; then
-                    printf 'Status: profile template has been updated since last apply\n'
-                fi
-                printf 'Run "ccenv update" to re-sync or "ccenv diff" to see changes.\n'
-            fi
-        else
-            printf 'Warning: profile "%s" no longer exists in %s\n' "$MARKER_NAME" "$PROFILES_DIR"
-        fi
-    else
-        printf 'No profile active in this project.\n'
-    fi
-
-    echo ""
-    printf 'Available profiles:\n'
-    cmd_list
-}
-
-cmd_update() {
-    local claude_dir="$(pwd)/.claude"
-
-    [[ -f "$claude_dir/$PROFILE_MARKER" ]] || die "update: no active profile in this project"
-
-    read_marker "$claude_dir"
-    local name="$MARKER_NAME"
-    local profile_dir="$PROFILES_DIR/$name"
-
-    [[ -d "$profile_dir" ]] || die "update: profile '$name' not found in $PROFILES_DIR"
-
-    # Show what would change
-    printf 'Comparing project .claude/ against profile "%s"...\n\n' "$name"
-
-    local has_changes=false
-
-    # Check files
-    for f in "${PROFILE_FILES[@]}"; do
-        local pf="$profile_dir/$f"
-        local cf="$claude_dir/$f"
-        if [[ -f "$pf" && -f "$cf" ]]; then
-            if ! diff -q "$pf" "$cf" >/dev/null 2>&1; then
-                printf '  modified: %s\n' "$f"
-                has_changes=true
-            fi
-        elif [[ -f "$pf" && ! -f "$cf" ]]; then
-            printf '  added:    %s\n' "$f"
-            has_changes=true
-        elif [[ ! -f "$pf" && -f "$cf" ]]; then
-            printf '  removed:  %s\n' "$f"
-            has_changes=true
-        fi
-    done
-
-    # Check dirs
-    for d in "${PROFILE_DIRS[@]}"; do
-        local pd="$profile_dir/$d"
-        local cd_="$claude_dir/$d"
-        if [[ -d "$pd" ]]; then
-            # Files in profile but not in project
-            (cd "$pd" && find . -type f | sort) | while IFS= read -r rf; do
-                rf="${rf#./}"
-                if [[ ! -f "$cd_/$rf" ]]; then
-                    printf '  added:    %s/%s\n' "$d" "$rf"
-                    has_changes=true
-                elif ! diff -q "$pd/$rf" "$cd_/$rf" >/dev/null 2>&1; then
-                    printf '  modified: %s/%s\n' "$d" "$rf"
-                    has_changes=true
-                fi
-            done
-        fi
-        if [[ -d "$cd_" ]]; then
-            # Files in project but not in profile
-            (cd "$cd_" && find . -type f | sort) | while IFS= read -r rf; do
-                rf="${rf#./}"
-                if [[ ! -d "$pd" ]] || [[ ! -f "$pd/$rf" ]]; then
-                    printf '  removed:  %s/%s\n' "$d" "$rf"
-                    has_changes=true
-                fi
-            done
-        fi
-    done
-
-    # has_changes may be set inside subshells — re-check by comparing hashes
-    local current_hash template_hash
-    current_hash="$(compute_hash "$claude_dir")"
-    template_hash="$(compute_hash "$profile_dir")"
-
-    if [[ "$current_hash" == "$template_hash" ]]; then
-        printf 'Already up to date.\n'
+def cmd_eject(_args: argparse.Namespace) -> None:
+    claude_dir = Path.cwd() / ".claude"
+    marker = read_marker(claude_dir)
+    if marker is None:
+        die("eject: no active profile in this project")
         return
-    fi
 
-    echo ""
-    confirm "Apply changes from profile '$name'?" || { echo "Aborted."; exit 0; }
+    marker_name, _ = marker
+    (claude_dir / PROFILE_MARKER).unlink()
 
-    remove_profile_files "$claude_dir"
-    copy_profile_files "$profile_dir" "$claude_dir"
+    print(f'Ejected from profile "{marker_name}".')
+    print("Project is now independent. Changes here won't affect the profile.")
 
-    local new_hash
-    new_hash="$(compute_hash "$profile_dir")"
-    write_marker "$claude_dir" "$name" "$new_hash"
 
-    printf 'Updated to latest "%s" profile.\n' "$name"
-}
+def cmd_status(_args: argparse.Namespace) -> None:
+    ensure_profiles_dir()
 
-cmd_list() {
-    ensure_profiles_dir
+    claude_dir = Path.cwd() / ".claude"
+    marker = read_marker(claude_dir)
 
-    local found=false
-    for profile_dir in "$PROFILES_DIR"/*/; do
-        [[ -d "$profile_dir" ]] || continue
-        found=true
-        local name
-        name="$(basename "$profile_dir")"
-        local agents skills rules has_claude_md
+    if marker is not None:
+        marker_name, marker_hash = marker
+        print(f"Active profile: {marker_name}")
 
-        agents="$(count_items "$profile_dir" "agents")"
-        skills="$(find "$profile_dir/skills" -name 'SKILL.md' 2>/dev/null | wc -l | tr -d ' ')"
-        rules="$(count_items "$profile_dir" "rules")"
+        profile_dir = PROFILES_DIR / marker_name
+        if profile_dir.is_dir():
+            current_hash = compute_hash(claude_dir)
+            template_hash = compute_hash(profile_dir)
 
-        if [[ -f "$profile_dir/CLAUDE.md" ]]; then
-            has_claude_md="yes"
-        else
-            has_claude_md="no"
-        fi
+            if current_hash == marker_hash and current_hash == template_hash:
+                print("Status: in sync with template")
+            else:
+                if current_hash != marker_hash:
+                    print("Status: project files have drifted from applied profile")
+                if template_hash != marker_hash:
+                    print("Status: profile template has been updated since last apply")
+                print('Run "ccenv update" to re-sync or "ccenv diff" to see changes.')
+        else:
+            print(f'Warning: profile "{marker_name}" no longer exists in {PROFILES_DIR}')
+    else:
+        print("No profile active in this project.")
 
-        printf '  %-20s  agents:%s  skills:%s  rules:%s  CLAUDE.md:%s\n' \
-            "$name" "$agents" "$skills" "$rules" "$has_claude_md"
-    done
+    print()
+    print("Available profiles:")
+    _print_profile_list()
 
-    if ! $found; then
-        printf '  (no profiles found)\n'
-    fi
-}
 
-cmd_diff() {
-    local name=""
+def cmd_update(_args: argparse.Namespace) -> None:
+    claude_dir = Path.cwd() / ".claude"
+    marker = read_marker(claude_dir)
+    if marker is None:
+        die("update: no active profile in this project")
+        return
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -*)  die "diff: unknown option '$1'" ;;
-            *)
-                [[ -z "$name" ]] && name="$1" || die "diff: unexpected argument '$1'"
-                ;;
-        esac
-        shift
-    done
+    name, _ = marker
+    profile_dir = PROFILES_DIR / name
+    if not profile_dir.is_dir():
+        die(f"update: profile '{name}' not found in {PROFILES_DIR}")
 
-    ensure_profiles_dir
+    print(f'Comparing project .claude/ against profile "{name}"...\n')
 
-    local claude_dir="$(pwd)/.claude"
-    [[ -d "$claude_dir" ]] || die "diff: no .claude/ directory in current project"
+    # Show what would change — files
+    for f in PROFILE_FILES:
+        pf = profile_dir / f
+        cf = claude_dir / f
+        if pf.is_file() and cf.is_file():
+            if pf.read_bytes() != cf.read_bytes():
+                print(f"  modified: {f}")
+        elif pf.is_file() and not cf.is_file():
+            print(f"  added:    {f}")
+        elif not pf.is_file() and cf.is_file():
+            print(f"  removed:  {f}")
 
-    # Default to active profile if no name given
-    if [[ -z "$name" ]]; then
-        if [[ -f "$claude_dir/$PROFILE_MARKER" ]]; then
-            read_marker "$claude_dir"
-            name="$MARKER_NAME"
-        else
-            die "diff: no profile name given and no active profile. Usage: ccenv diff [name]"
-        fi
-    fi
+    # Show what would change — dirs
+    for d in PROFILE_DIRS:
+        pd = profile_dir / d
+        cd = claude_dir / d
+        profile_files = collect_relative_files(pd)
+        project_files = collect_relative_files(cd)
+        all_files = sorted(profile_files | project_files)
+        for rf in all_files:
+            in_profile = (pd / rf).is_file()
+            in_project = (cd / rf).is_file()
+            if in_profile and in_project:
+                if (pd / rf).read_bytes() != (cd / rf).read_bytes():
+                    print(f"  modified: {d}/{rf}")
+            elif in_profile:
+                print(f"  added:    {d}/{rf}")
+            else:
+                print(f"  removed:  {d}/{rf}")
 
-    local profile_dir="$PROFILES_DIR/$name"
-    [[ -d "$profile_dir" ]] || die "diff: profile '$name' not found"
+    current_hash = compute_hash(claude_dir)
+    template_hash = compute_hash(profile_dir)
 
-    printf 'Comparing .claude/ against profile "%s":\n\n' "$name"
+    if current_hash == template_hash:
+        print("Already up to date.")
+        return
 
-    local any_diff=false
+    print()
+    if not confirm(f"Apply changes from profile '{name}'?"):
+        print("Aborted.")
+        return
+
+    remove_profile_files(claude_dir)
+    copy_profile_files(profile_dir, claude_dir)
+
+    new_hash = compute_hash(profile_dir)
+    write_marker(claude_dir, name, new_hash)
+
+    print(f'Updated to latest "{name}" profile.')
+
+
+def cmd_list(_args: argparse.Namespace) -> None:
+    ensure_profiles_dir()
+    _print_profile_list()
+
+
+def _print_profile_list() -> None:
+    profiles = sorted(p for p in PROFILES_DIR.iterdir() if p.is_dir())
+    if not profiles:
+        print("  (no profiles found)")
+        return
+
+    for profile_dir in profiles:
+        name = profile_dir.name
+        agents = count_md_files(profile_dir, "agents")
+        skills = count_skills(profile_dir)
+        rules = count_md_files(profile_dir, "rules")
+        has_claude_md = "yes" if (profile_dir / "CLAUDE.md").is_file() else "no"
+        print(f"  {name:<20}  agents:{agents}  skills:{skills}  rules:{rules}  CLAUDE.md:{has_claude_md}")
+
+
+def cmd_diff(args: argparse.Namespace) -> None:
+    name: str | None = args.name
+
+    ensure_profiles_dir()
+
+    claude_dir = Path.cwd() / ".claude"
+    if not claude_dir.is_dir():
+        die("diff: no .claude/ directory in current project")
+
+    if name is None:
+        marker = read_marker(claude_dir)
+        if marker is None:
+            die("diff: no profile name given and no active profile. Usage: ccenv diff [name]")
+        name = marker[0]
+
+    profile_dir = PROFILES_DIR / name
+    if not profile_dir.is_dir():
+        die(f"diff: profile '{name}' not found")
+
+    print(f'Comparing .claude/ against profile "{name}":\n')
+
+    any_diff = False
 
     # Compare files
-    for f in "${PROFILE_FILES[@]}"; do
-        local pf="$profile_dir/$f"
-        local cf="$claude_dir/$f"
-        if [[ -f "$pf" && -f "$cf" ]]; then
-            if ! diff -q "$pf" "$cf" >/dev/null 2>&1; then
-                printf '=== %s ===\n' "$f"
-                diff -u "$pf" "$cf" --label "profile:$f" --label "project:$f" || true
-                echo ""
-                any_diff=true
-            fi
-        elif [[ -f "$pf" && ! -f "$cf" ]]; then
-            printf '=== %s (only in profile) ===\n\n' "$f"
-            any_diff=true
-        elif [[ ! -f "$pf" && -f "$cf" ]]; then
-            printf '=== %s (only in project) ===\n\n' "$f"
-            any_diff=true
-        fi
-    done
+    for f in PROFILE_FILES:
+        pf = profile_dir / f
+        cf = claude_dir / f
+        if pf.is_file() and cf.is_file():
+            if pf.read_bytes() != cf.read_bytes():
+                print(f"=== {f} ===")
+                diff = difflib.unified_diff(
+                    file_lines(pf), file_lines(cf),
+                    fromfile=f"profile:{f}", tofile=f"project:{f}",
+                )
+                sys.stdout.writelines(diff)
+                print()
+                any_diff = True
+        elif pf.is_file() and not cf.is_file():
+            print(f"=== {f} (only in profile) ===\n")
+            any_diff = True
+        elif not pf.is_file() and cf.is_file():
+            print(f"=== {f} (only in project) ===\n")
+            any_diff = True
 
     # Compare dirs
-    for d in "${PROFILE_DIRS[@]}"; do
-        local pd="$profile_dir/$d"
-        local cd_="$claude_dir/$d"
+    for d in PROFILE_DIRS:
+        pd = profile_dir / d
+        cd = claude_dir / d
+        profile_files = collect_relative_files(pd)
+        project_files = collect_relative_files(cd)
+        all_files = sorted(profile_files | project_files)
 
-        # Collect all relative file paths from both
-        local all_files=()
-        if [[ -d "$pd" ]]; then
-            while IFS= read -r rf; do
-                all_files+=("${rf#./}")
-            done < <(cd "$pd" && find . -type f | sort)
-        fi
-        if [[ -d "$cd_" ]]; then
-            while IFS= read -r rf; do
-                all_files+=("${rf#./}")
-            done < <(cd "$cd_" && find . -type f | sort)
-        fi
+        for rf in all_files:
+            pfp = pd / rf
+            cfp = cd / rf
+            if pfp.is_file() and cfp.is_file():
+                if pfp.read_bytes() != cfp.read_bytes():
+                    print(f"=== {d}/{rf} ===")
+                    diff = difflib.unified_diff(
+                        file_lines(pfp), file_lines(cfp),
+                        fromfile=f"profile:{d}/{rf}", tofile=f"project:{d}/{rf}",
+                    )
+                    sys.stdout.writelines(diff)
+                    print()
+                    any_diff = True
+            elif pfp.is_file() and not cfp.is_file():
+                print(f"=== {d}/{rf} (only in profile) ===\n")
+                any_diff = True
+            elif not pfp.is_file() and cfp.is_file():
+                print(f"=== {d}/{rf} (only in project) ===\n")
+                any_diff = True
 
-        # Deduplicate
-        local unique_files
-        unique_files="$(printf '%s\n' "${all_files[@]}" 2>/dev/null | sort -u)" || true
+    if not any_diff:
+        print("No differences found.")
 
-        while IFS= read -r rf; do
-            [[ -z "$rf" ]] && continue
-            local pf="$pd/$rf"
-            local cf="$cd_/$rf"
-            if [[ -f "$pf" && -f "$cf" ]]; then
-                if ! diff -q "$pf" "$cf" >/dev/null 2>&1; then
-                    printf '=== %s/%s ===\n' "$d" "$rf"
-                    diff -u "$pf" "$cf" --label "profile:$d/$rf" --label "project:$d/$rf" || true
-                    echo ""
-                    any_diff=true
-                fi
-            elif [[ -f "$pf" && ! -f "$cf" ]]; then
-                printf '=== %s/%s (only in profile) ===\n\n' "$d" "$rf"
-                any_diff=true
-            elif [[ ! -f "$pf" && -f "$cf" ]]; then
-                printf '=== %s/%s (only in project) ===\n\n' "$d" "$rf"
-                any_diff=true
-            fi
-        done <<< "$unique_files"
-    done
 
-    if ! $any_diff; then
-        printf 'No differences found.\n'
-    fi
-}
+# ─── CLI ───────────────────────────────────────────────────────────────────────
 
-cmd_help() {
-    cat <<'HELP'
-ccenv — Claude Code Environments
-
-Manage reusable configuration profiles for Claude Code.
-
-Usage:
-  ccenv <command> [arguments]
-
-Commands:
-  save <name> [--from global|project]   Save current config as a profile
-  use <name>                            Apply a profile to the current project
-  eject                                 Detach project from its profile
-  status                                Show profile state for this project
-  update                                Re-sync project from profile template
-  list                                  List all available profiles
-  diff [name]                           Compare project config against a profile
-  help                                  Show this help message
-  version                               Show version
-
+SHELL_INTEGRATION = """\
 Shell integration:
   Add to your .bashrc or .zshrc to auto-apply --setting-sources:
 
@@ -533,33 +431,69 @@ Shell integration:
       else
         command claude "$@"
       fi
+    }"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ccenv",
+        description="ccenv — Claude Code Environments\n\nManage reusable configuration profiles for Claude Code.",
+        epilog=SHELL_INTEGRATION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"ccenv {VERSION}")
+
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    # save
+    p_save = sub.add_parser("save", help="Save current config as a profile")
+    p_save.add_argument("name", help="Profile name")
+    p_save.add_argument("--from", dest="source", default="global", choices=["global", "project"],
+                        help="Config source (default: global)")
+
+    # use
+    p_use = sub.add_parser("use", help="Apply a profile to the current project")
+    p_use.add_argument("name", help="Profile name")
+
+    # eject
+    sub.add_parser("eject", help="Detach project from its profile")
+
+    # status
+    sub.add_parser("status", help="Show profile state for this project")
+
+    # update
+    sub.add_parser("update", help="Re-sync project from profile template")
+
+    # list
+    sub.add_parser("list", help="List all available profiles")
+
+    # diff
+    p_diff = sub.add_parser("diff", help="Compare project config against a profile")
+    p_diff.add_argument("name", nargs="?", default=None, help="Profile name (defaults to active profile)")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return
+
+    commands = {
+        "save": cmd_save,
+        "use": cmd_use,
+        "eject": cmd_eject,
+        "status": cmd_status,
+        "update": cmd_update,
+        "list": cmd_list,
+        "diff": cmd_diff,
     }
 
-HELP
-}
+    commands[args.command](args)
 
-cmd_version() {
-    printf 'ccenv %s\n' "$VERSION"
-}
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
-
-main() {
-    local cmd="${1:-help}"
-    shift 2>/dev/null || true
-
-    case "$cmd" in
-        save)    cmd_save "$@" ;;
-        use)     cmd_use "$@" ;;
-        eject)   cmd_eject ;;
-        status)  cmd_status ;;
-        update)  cmd_update ;;
-        list)    cmd_list ;;
-        diff)    cmd_diff "$@" ;;
-        help|--help|-h)    cmd_help ;;
-        version|--version|-v) cmd_version ;;
-        *)       die "unknown command '$cmd'. Run 'ccenv help' for usage." ;;
-    esac
-}
-
-main "$@"
+if __name__ == "__main__":
+    main()
